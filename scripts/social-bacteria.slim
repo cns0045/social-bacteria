@@ -1,0 +1,300 @@
+//Meta-pop-gen model of public goods cooperation and defection
+
+/* TODO
+ * isolate effects of spite w/ no cheats -- summary plots
+ * summary plots w/ virulence added
+ * add regular logging tracking new metrics
+ */
+
+initialize() {
+	setwd("C:/msys64/home/schne/social-bacteria");
+	initializeSLiMModelType("nonWF");
+	if (exists("slimgui")) {
+		defineConstant("LogFile", "data/gui-runs.csv");
+		defineConstant("ChButton", 1);
+		defineConstant("SpButton", 1);
+		defineConstant("Putton", 0);
+		defineConstant("Run", 0);
+		defineConstant("m", 2e-6);
+		defineConstant("Kx", 10);
+		defineConstant("virulence", 0);
+	} else {
+		defineConstant("ChButton", chbutto); //switch between cheaters (1) and no cheaters (0)
+		defineConstant("SpButton", spbutto); //switch between spiteful (1) and spitefree (0) cheats
+		defineConstant("Putton", 0); //switch to add a prudence allele [Haven't played with this yet]
+		defineConstant("virulence", vir); //switch between virulence (1) and no virulence (0)
+		defineConstant("Run", run);
+		defineConstant("m", mi); //between-xylem vessel migration rate [2^-6 - 2^-3]
+		defineConstant("Kx", kx); //xylem vessel carrying capacity [10,20,50]
+		defineConstant("LogFile",  paste('logs/log-mut-freqs-run' + Run + '.csv')); // the filename for the log file	
+	}	
+	defineConstant("metaPopSide", 20); //length of side of meta-pop grid [8]
+	defineConstant("lambda", 1.2); //base fecundity of parasites
+	defineConstant("dh", 0.0); //base death rate for hosts [0.001]
+	defineConstant("C1", 0.1); //individual-level fecundity cost of public goods making [0.01]
+	defineConstant("C2", 0.0); //virulence cost of public goods production [0.0001]
+	defineConstant("C3", 0.01); //ind-level fecundity cost of bacteriocin production [0.01, 0.001] *0.005
+	defineConstant("B1", 0.01); //per-local cooperator fecundity benefit of public goods [0.02]
+	defineConstant("B2", 0.0); //Kx benefit from public goods production [0.01]
+	defineConstant("B3", 0.0); //m benefit from public goods production [0.01]
+	defineConstant("C4o", 1.0); //max viability cost of spite to non-spiters [0.9]
+	initializeMutationType("m1", 1.0, "f", 0.0); //a public goods cheat allele [0.01]
+	initializeMutationType("m2", 1.0, "f", 0.0); //a prudence allele [0.02]
+	initializeMutationType("m3", 1.0, "f", 0.0); //a spite allele [-0.01]
+	m1.convertToSubstitution = F; //need to keep all alleles around
+	m2.convertToSubstitution = F;
+	m3.convertToSubstitution = F;
+	initializeGenomicElementType("g1", c(m1,m2,m3), c(1,1,1));
+	initializeGenomicElement(g1, 0, 99999);
+	initializeMutationRate(0); //where just going to add drawn mutations
+	initializeRecombinationRate(0); //let's start without recombination
+}
+
+
+// Set up the meta-pop structure
+// Nx*Nh subpopulations i.e. xylem cells. About 10% start off infected.
+// Start off with a monomorphic population of non-prudent, non-spiteful
+// public goods cooperators
+// also make a mapping of xylem cell IDs to host IDs
+// Set up logging
+1 early() {
+	Nt = asInteger(metaPopSide^2);
+	for (i in 1:Nt){
+		coin = rbinom(1,1,0.1);
+		if (coin == 1){
+			seeders = asInteger(round(runif(1,1,Kx)));
+			sim.addSubpop(i, seeders);
+		} else {
+			sim.addSubpop(i, 0);
+		}
+	}
+	subs = sim.subpopulations;
+	subs.tag = 0; // mark all xylem cells as not blacklisted to start
+	inds = subs.individuals;
+	
+	// Set up logging of end conditions
+	//log = community.createLogFile("Ends-isolated.csv", append = T);
+	log = community.createLogFile(LogFile, append = F, logInterval=10);
+	log.addCustomColumn("Run", "Run;");
+	log.addCycle();
+	log.addCustomColumn("Virulence", "virulence;");
+	log.addCustomColumn("Cheat", "ChButton;");
+	log.addCustomColumn("Spite", "SpButton;");
+	log.addCustomColumn("MigrationRate", "m;");
+	log.addCustomColumn("SubpopCarryingCapacity", "Kx;");
+	log.addCustomColumn("CheatFreq", "size(sim.subpopulations.individuals[sim.subpopulations.individuals.countOfMutationsOfType(m1)>0])/size(sim.subpopulations.individuals);");
+	log.addCustomColumn("SpiteFreq", "size(sim.subpopulations.individuals[sim.subpopulations.individuals.countOfMutationsOfType(m3)>0])/size(sim.subpopulations.individuals);");
+	//log.addCustomColumn("TeetFreq", "size(inds[inds.countOfMutationsOfType(m2)>0])/size(inds);"); // Not in use yet
+	//proportion of populated subpops
+	//proportion of total carrying capacity
+	//proportion of total whitelist carrying capacity
+	//proportion blacklisted
+	//mean logged at end (could do in R after)
+	//defineConstant("Ends", log);
+	defineConstant("Log", log);
+}
+
+//Do clonal reproduction
+//fecundity varies according to local density of cooperators
+//also spiters take a fecundity hit, and teetotalers reduce their fecundity 
+//for the good of the group
+1: reproduction() {
+	indM1 = individual.countOfMutationsOfType(m1);
+	indM2 = individual.countOfMutationsOfType(m2);
+	indM3 = individual.countOfMutationsOfType(m3);
+	coopStatus = 1;
+	prudence = 0;
+	spiteStatus = 0;
+	if (indM1 > 0){ coopStatus = 0;}
+	if (indM2 > 0){ prudence = 1;}
+	if (indM3 > 0){ spiteStatus = 1;}
+	localX = individual.subpopulation;
+	neighbours = localX.individuals;
+	cooperators = neighbours[neighbours.countOfMutationsOfType(m1)==0];
+	teetotaler = neighbours[neighbours.countOfMutationsOfType(m2)>0];
+	benefit = size(cooperators)*B1; //cooperators help everyone
+	lNx = size(neighbours);
+	density = Kx/lNx; //TODO: this prudence is dependent only on the local cell density
+	//not the host-density. It is also insensitive to any boosts to K from cooperation
+	//concentration = size(spiters)/Kx;
+	cost = 0.0;
+	costotaler = 0.0;
+	costSpiter = 0.0;
+	lambda_o = lambda;
+	if (prudence == 1){lambda_o = lambda - (1/(1*exp(-1*density)));}
+	if (coopStatus == 1){cost = C1;}
+	if (spiteStatus == 1){costSpiter = C3;}
+	lambda_i = lambda_o + benefit - cost - costotaler - costSpiter;
+	batch = rpois(1, lambda_i);
+	for (j in seqLen(batch)){
+		subpop.addCloned(individual);
+	}
+}
+
+//Do migration. This is the fiddly part
+1: early(){
+	inds = sim.subpopulations.individuals;
+	if (size(inds) == 0){
+		catn("Pathogen are extinct!!");
+		sim.simulationFinished();
+	}
+	else{
+		subs = sim.subpopulations;
+		//popGrid = matrix(subs[(1:metaPopSide^2)-1], nrow = metaPopSide, ncol = metaPopSide, byrow = T);
+		for (x in 1:metaPopSide){
+			for (y in 1:metaPopSide){
+				focalID = (x-1)+(y-1)*metaPopSide + 1;
+				focalSubpop = subs[focalID-1];
+				
+				//Cool! Your code here is slicker than mine!
+				
+				focalN = focalSubpop.individualCount;
+				if (!focalN > 0){ next; } // only keep going if subpop is not empty
+				
+				neighbors = integer(0);
+				possibleNeighbors = c(focalID-1, focalID+1, focalID-metaPopSide, focalID+metaPopSide); // left, right, up, down
+				validNeighbors = c(x > 1, x < metaPopSide, y > 1, y < metaPopSide); // logical vector of whether the neighbors are valid destinations for migrants
+				for (i in 0:3) {
+					if (validNeighbors[i]) {
+						if (subs[possibleNeighbors[i]-1].tag == 0) { // if tag is 0 - not blacklisted
+							neighbors = c(neighbors, possibleNeighbors[i]);
+						}
+					}
+				}
+				
+				if (size(neighbors) > 0){
+					nFocalMigrants = min(focalN, rpois(1, focalN * m));
+					if (nFocalMigrants > 0){
+						focalMigrants = sample(focalSubpop.individuals, nFocalMigrants);
+						for (migrant in focalMigrants){
+							destID = sample(neighbors, 1);
+							dest = subs[destID-1];
+							dest.takeMigrants(migrant);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Do fitnessScaling of spite dependent on subpop
+// Do density-dependence fitnessScaling
+// Density-dependent subpop extinction - blacklist those xylem cells [20]? cycles
+1: early(){
+	subs = sim.subpopulations;
+	for (subpop in sim.subpopulations) { // TODO: vectorize
+		inds = subpop.individuals;
+		neighbours = subpop.individuals; //this is the same as inds - unnecessary?
+		spiters = neighbours[neighbours.countOfMutationsOfType(m3)>0];
+		
+		//NB: and cooperators are this
+		cooperators = inds[inds.countOfMutationsOfType(m3)==0];
+		
+		Nasty = size(spiters);
+		if (Nasty > 0) {
+			indsM3 = inds.countOfMutationsOfType(m3);
+			
+			//NB: Well, your plot is telling us that the odds of a spite allele fixing
+			//does not depend on migration rates or K values. So, I would try and 
+			//mess with this concentration effect function to try and find something that
+			//is more sensitive to metapopulaiton structure.
+			
+			spiteEffect = 1/(1+exp(-0.5*(Nasty-(Kx/2)))); //the spite effect depends on local concentration
+			coopfit = inds[indsM3 == 0].fitnessScaling;
+			coopfit = coopfit - min(coopfit, spiteEffect); //only non-spiters are impacted by spite
+			
+			//Oh wait. We're missing something important. we haven't actually updated the 
+			//fitnessScaling property of cooperating individuals. Need to add this:
+			
+			cooperators.fitnessScaling = coopfit;
+		
+		
+		}
+	}
+	subs.fitnessScaling = min((Kx/subs.individualCount),2.0);
+	
+	blacklist = subs[subs.tag != 0];
+	blacklist.tag = blacklist.tag - 1; // count down one
+	blacklist = subs[subs.tag != 0];
+	
+	whitelist = subs[subs.tag == 0];
+	//populated = whitelist[whitelist.individualCount > 0]; // candidates for extinction
+	density = whitelist.individualCount/Kx;
+	backgroundMortality = 10e-3; //make variable constant
+	// TODO: add switch for virulence (leave on base rate)
+	
+	if (virulence == 1) {
+		density = whitelist.individualCount/Kx; //more density -> more likely mortality
+		coinFlip = rbinom(size(whitelist), 1, min(backgroundMortality + density, 0.1));
+		//coinFlip = rbinom(size(whitelist), 1, (backgroundMortality + (density*0.1))); //better scaling
+	} else {
+		coinFlip = rbinom(size(whitelist), 1, backgroundMortality);
+	}
+	
+	kill = whitelist[coinFlip == 1];
+	kill.tag = 20; // add unlucky subpops to blacklist for this many cycles
+	sim.killIndividuals(kill.individuals);
+}
+
+//give some individuals the cheater allele, and some the prudence allele
+20 early(){
+	if (size(sim.subpopulations.individuals) == 0){
+		sim.simulationFinished();
+	} else {
+		inds = sim.subpopulations.individuals;
+		if (ChButton == 1) {
+			cheats = sample(inds, asInteger((size(inds)/10))); //TODO: made this a free parameter
+			cheats.genomes.addNewDrawnMutation(m1,1000);
+		}
+		if (SpButton == 1){
+			if (ChButton == 1) {
+				//add a spite allele that is tightly linked to the cheat allele
+				cheats.genomes.addNewDrawnMutation(m3,1050);
+			}
+			if (ChButton == 0) {
+				//add independent spite allele
+				spiters = sample(inds, asInteger((size(inds)/10)));
+				spiters.genomes.addNewDrawnMutation(m3,1050);
+			}
+		}
+		if (Putton == 1){
+			//teets = sample(inds, asInteger(size(inds)/2));
+			teets = sample(inds, 10);
+			teets.genomes.addNewDrawnMutation(m2,5000);
+		}
+	}
+}
+
+//Let's see how we're doing
+//Do some logging
+1: late() {
+	if ((sim.cycle-1) > 10){
+		if ((sim.cycle -1) % 10 == 0){
+			inds = sim.subpopulations.individuals;
+			cheats = inds[inds.countOfMutationsOfType(m1)>0];
+			teetotalers = inds[inds.countOfMutationsOfType(m2)>0];
+			cheatFreq = size(cheats)/size(inds);
+			teetFreq = size(teetotalers)/size(inds);
+			if (cheatFreq>0.95){ //with 1.0, it takes forever to hunt 'em all down
+				catn("Cheats took over!");
+				Log.logRow();
+				sim.simulationFinished();
+			}
+			if (cheatFreq==0.0){
+				catn("Cheats dropped out.");
+				Log.logRow();
+				sim.simulationFinished();
+			}
+			else {
+				catn(c(sim.cycle-1, "N:", sum(sim.subpopulations.individualCount), "pc:", cheatFreq, "pt:", teetFreq));
+			}
+		}
+	}
+}
+
+501 early() {
+	Log.logRow();
+	sim.simulationFinished();
+}
+
